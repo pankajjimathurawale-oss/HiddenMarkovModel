@@ -3,10 +3,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import torch
 import plotly.express as px
 import plotly.graph_objects as go
-from itertools import combinations
+from hmmlearn import hmm
 from datetime import datetime
 
 # ────────────────────────────────────────────────
@@ -77,86 +76,28 @@ if uploaded_file is not None:
         run_button = st.button("Run HMM Backtest", type="primary", use_container_width=True)
 
     # ────────────────────────────────────────────────
-    #  Gaussian HMM class (same as before)
-    # ────────────────────────────────────────────────
-    class GaussianHMM(torch.nn.Module):
-        def __init__(self, n_states, n_dims):
-            super().__init__()
-            self.n_states = n_states
-            self.n_dims = n_dims
-            self.log_start = torch.nn.Parameter(torch.randn(n_states))
-            self.log_trans = torch.nn.Parameter(torch.randn(n_states, n_states))
-            self.mu       = torch.nn.Parameter(torch.randn(n_states, n_dims))
-            self.log_var  = torch.nn.Parameter(torch.randn(n_states, n_dims))
-
-        def _log_normal(self, x, mu, log_var):
-            var = torch.exp(log_var)
-            return -0.5 * (np.log(2 * np.pi) + log_var + (x - mu)**2 / var)
-
-        def emission_log_prob(self, x):
-            return self._log_normal(x[None, :], self.mu[:, None, :], self.log_var[:, None, :]).sum(dim=2).T
-
-        def log_alpha(self, x):
-            T = x.size(0)
-            log_alpha = torch.zeros(T, self.n_states)
-            log_start = self.log_start - torch.logsumexp(self.log_start, 0)
-            log_trans = self.log_trans - torch.logsumexp(self.log_trans, 1)[:, None]
-            b = self.emission_log_prob(x)
-            log_alpha[0] = log_start + b[0]
-            for t in range(1, T):
-                log_alpha[t] = torch.logsumexp(log_alpha[t-1][:, None] + log_trans, 0) + b[t]
-            return log_alpha
-
-        def forward(self, x):
-            log_alpha = self.log_alpha(x)
-            return torch.logsumexp(log_alpha[-1], 0)
-
-        def viterbi(self, x):
-            T = x.size(0)
-            b = self.emission_log_prob(x)
-            log_start = self.log_start - torch.logsumexp(self.log_start, 0)
-            log_trans = self.log_trans - torch.logsumexp(self.log_trans, 1)[:, None]
-
-            delta = torch.zeros(T, self.n_states)
-            phi   = torch.zeros(T, self.n_states, dtype=torch.long)
-
-            delta[0] = log_start + b[0]
-            phi[0]   = 0
-
-            for t in range(1, T):
-                temp = delta[t-1][:, None] + log_trans
-                delta[t] = temp.max(dim=0)[0] + b[t]
-                phi[t]   = temp.argmax(dim=0)
-
-            path = torch.zeros(T, dtype=torch.long)
-            path[T-1] = delta[T-1].argmax()
-
-            for t in range(T-2, -1, -1):
-                path[t] = phi[t+1, path[t+1]]
-
-            return path.numpy()
-
-    # ────────────────────────────────────────────────
     #  Run button logic
     # ────────────────────────────────────────────────
     if run_button:
-        with st.spinner(f"Fitting {n_states}-state HMM using {selected_features} ... (may take 30–120 seconds)"):
+        with st.spinner(f"Fitting {n_states}-state Gaussian HMM using {selected_features} ..."):
             # Prepare observation matrix
-            obs = df[selected_features].values.astype(np.float32)
+            obs = df[selected_features].values
 
-            # Fit HMM
-            model = GaussianHMM(n_states, len(selected_features))
-            opt = torch.optim.Adam(model.parameters(), lr=0.01)
-            obs_t = torch.from_numpy(obs)
+            # Fit HMM with hmmlearn (much faster and more stable)
+            model = hmm.GaussianHMM(
+                n_components=n_states,
+                covariance_type="diag",
+                n_iter=100,               # usually enough
+                init_params="stmc",
+                verbose=False
+            )
 
-            for _ in range(1000):
-                opt.zero_grad()
-                log_lik = -model(obs_t)
-                log_lik.backward()
-                opt.step()
-
-            # Decode states
-            states = model.viterbi(obs_t)
+            try:
+                model.fit(obs)
+                states = model.predict(obs)
+            except Exception as e:
+                st.error(f"HMM fitting failed: {str(e)}")
+                st.stop()
 
         df_result = df.copy()
         df_result['State'] = states
@@ -167,8 +108,12 @@ if uploaded_file is not None:
         df_result['Strategy_Return'] = 0.0
 
         mean_ret_by_state = df_result.groupby('State')['Returns'].mean()
-        bull_state  = mean_ret_by_state.idxmax()
-        bear_state  = mean_ret_by_state.idxmin()
+        if len(mean_ret_by_state) < 2:
+            st.warning("Could not identify distinct bull/bear states.")
+            bull_state = bear_state = mean_ret_by_state.index[0]
+        else:
+            bull_state  = mean_ret_by_state.idxmax()
+            bear_state  = mean_ret_by_state.idxmin()
 
         df_result.loc[df_result['State'] == bull_state, 'Strategy_Return'] = df_result['Returns']
         df_result.loc[df_result['State'] == bear_state, 'Strategy_Return'] = -df_result['Returns']
@@ -179,7 +124,7 @@ if uploaded_file is not None:
                 df_result.loc[df_result['State'] == ns, 'Strategy_Return'] = 0.0
 
         # Cumulative returns
-        df_result['Cum_BH']      = (1 + df_result['Returns']).cumprod()
+        df_result['Cum_BH']       = (1 + df_result['Returns']).cumprod()
         df_result['Cum_Strategy'] = (1 + df_result['Strategy_Return']).cumprod()
 
         # Performance metrics
