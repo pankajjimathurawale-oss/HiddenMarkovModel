@@ -1,4 +1,4 @@
-# app.py     ──  Streamlit version ──  Walk-forward / no look-ahead bias
+# app.py     ──  Streamlit version ──  Walk-forward / no look-ahead bias (FULLY FIXED)
 
 import streamlit as st
 import pandas as pd
@@ -83,7 +83,7 @@ if uploaded_file is not None:
             for t in range(warmup_days, len(df_result)):
                 past = df_result.iloc[:t].copy()
 
-                # Normalize GEX using only past data
+                # Normalize GEX using past only
                 if has_gex:
                     past_mean = past['GEX'].mean()
                     past_std  = past['GEX'].std() or 1.0
@@ -92,7 +92,6 @@ if uploaded_file is not None:
 
                 past_obs = past[selected_features].values
 
-                # Fit model on past only
                 model = hmm.GaussianHMM(
                     n_components=n_states,
                     covariance_type="diag",
@@ -104,13 +103,12 @@ if uploaded_file is not None:
                 try:
                     model.fit(past_obs)
                 except:
-                    continue  # skip if fit fails
+                    continue
 
-                # Get past states to compute historical means
+                # Get past states → compute historical means using PAST only
                 past_states = model.predict(past_obs)
                 past['State'] = past_states
 
-                # Decide bull/bear using PAST returns only
                 mean_ret = past.groupby('State')['Returns'].mean()
 
                 if len(mean_ret) < 2:
@@ -125,7 +123,6 @@ if uploaded_file is not None:
                         today_row['GEX_norm'] = today_gex_norm
                     today_obs = today_row[selected_features].values
 
-                    # Predict today's state
                     today_state = model.predict(today_obs)[0]
 
                     if today_state == bull_state:
