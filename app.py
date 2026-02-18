@@ -8,7 +8,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 # ────────────────────────────────────────────────
-# Networks
+# Networks (unchanged)
 # ────────────────────────────────────────────────
 class Actor(nn.Module):
     def __init__(self, state_dim=6, n_actions=3):
@@ -35,14 +35,13 @@ class Critic(nn.Module):
         return self.net(x)
 
 # ────────────────────────────────────────────────
-# PPO core functions
+# PPO functions (with higher entropy + KL check)
 # ────────────────────────────────────────────────
 def collect_rollout(actor, states):
-    """ Deterministic replay → one long episode """
-    states_t  = torch.FloatTensor(states.values)
-    probs     = actor(states_t)
-    dist      = Categorical(probs)
-    actions   = dist.sample()
+    states_t = torch.FloatTensor(states.values)
+    probs = actor(states_t)
+    dist = Categorical(probs)
+    actions = dist.sample()
     log_probs = dist.log_prob(actions)
     return actions.numpy(), log_probs.detach().numpy(), dist
 
@@ -58,7 +57,7 @@ def compute_gae(rewards, values, next_value, gamma=0.99, lam=0.95):
     return advantages, returns
 
 def ppo_update(actor, critic, optimizer_a, optimizer_c, states, actions, old_log_probs,
-               advantages, returns, clip_eps=0.2, entropy_coeff=0.03, epochs=10, batch_size=64):
+               advantages, returns, clip_eps=0.2, entropy_coeff=0.05, epochs=8, batch_size=64):
     states_t = torch.FloatTensor(states.values)
     actions_t = torch.LongTensor(actions)
     old_log_probs_t = torch.FloatTensor(old_log_probs)
@@ -76,7 +75,6 @@ def ppo_update(actor, critic, optimizer_a, optimizer_c, states, actions, old_log
             adv = adv_t[s_idx]
             ret = ret_t[s_idx]
             
-            # Actor
             probs = actor(s)
             dist = Categorical(probs)
             new_lp = dist.log_prob(a)
@@ -86,7 +84,6 @@ def ppo_update(actor, critic, optimizer_a, optimizer_c, states, actions, old_log
             surr2 = torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * adv
             actor_loss = -torch.min(surr1, surr2).mean() - entropy_coeff * dist.entropy().mean()
             
-            # Critic
             value = critic(s).squeeze()
             critic_loss = (value - ret).pow(2).mean()
             
@@ -101,7 +98,7 @@ def ppo_update(actor, critic, optimizer_a, optimizer_c, states, actions, old_log
 # ────────────────────────────────────────────────
 # Streamlit App
 # ────────────────────────────────────────────────
-st.title("PPO RL Trading Simulator")
+st.title("PPO RL Trading Simulator – Realistic Version")
 
 uploaded_file = st.file_uploader("Upload gamma_values-old.csv", type="csv")
 
@@ -109,37 +106,31 @@ if uploaded_file is not None:
     df = pd.read_csv(uploaded_file, parse_dates=['TIMESTAMP'], date_format='%m/%d/%Y')
     df = df.sort_values('TIMESTAMP').reset_index(drop=True)
 
-    # ────────────────────────────────────────────────
-    # Feature engineering – lagged to prevent look-ahead bias
-    # ────────────────────────────────────────────────
+    # Feature engineering – lagged
     df['prev_return'] = df['NiftyClose'].pct_change().fillna(0)
-    df['vol_5d']      = df['prev_return'].rolling(5).std().fillna(0)
+    df['vol_5d'] = df['prev_return'].rolling(5).std().fillna(0)
 
-    # Lag gamma & price features (decision at open of t uses data up to t-1)
-    df['lag_GEX']            = df['GEX'].shift(1)
-    df['lag_Gamma_Flip']     = df['Gamma Flip'].shift(1)
-    df['lag_NiftyClose']     = df['NiftyClose'].shift(1)
+    df['lag_GEX'] = df['GEX'].shift(1)
+    df['lag_Gamma_Flip'] = df['Gamma Flip'].shift(1)
+    df['lag_NiftyClose'] = df['NiftyClose'].shift(1)
     df['lag_Max_SuperGamma'] = df['Max SuperGamma'].shift(1)
-    df['lag_DTE']            = df['DTE'].shift(1)
+    df['lag_DTE'] = df['DTE'].shift(1)
 
-    df['GEX_norm']      = df['lag_GEX'] / 1e6
-    df['flip_prox']     = (df['lag_NiftyClose'] - df['lag_Gamma_Flip']) / df['lag_NiftyClose']
+    df['GEX_norm'] = df['lag_GEX'] / 1e6
+    df['flip_prox'] = (df['lag_NiftyClose'] - df['lag_Gamma_Flip']) / df['lag_NiftyClose']
     df['superg_spread'] = (df['lag_Max_SuperGamma'] - df['lag_Gamma_Flip']) / 100
-    df['dte_norm']      = df['lag_DTE'] / 10
+    df['dte_norm'] = df['lag_DTE'] / 10
 
     state_cols = ['GEX_norm', 'flip_prox', 'superg_spread', 'dte_norm', 'prev_return', 'vol_5d']
 
-    # Fill NaNs (first rows) and normalize
     df[state_cols] = df[state_cols].fillna(0)
     df[state_cols] = (df[state_cols] - df[state_cols].mean()) / df[state_cols].std()
 
-    # ────────────────────────────────────────────────
-    # INTRADAY reward (open-to-close, no overnight)
-    # ────────────────────────────────────────────────
+    # Intraday reward (raw – no amplification)
     df['intraday_return'] = (df['NiftyClose'] - df['NiftyOpen']) / df['NiftyOpen']
-    df['intraday_return'] = df['intraday_return'].fillna(0)   # last day or missing
+    df['intraday_return'] = df['intraday_return'].fillna(0)
 
-    # Split train/test
+    # Split
     train_df = df[df['TIMESTAMP'] < '2025-07-01'].copy()
     test_df = df[df['TIMESTAMP'] >= '2025-07-01'].copy()
 
@@ -149,83 +140,81 @@ if uploaded_file is not None:
         opt_a = optim.Adam(actor.parameters(), lr=3e-4)
         opt_c = optim.Adam(critic.parameters(), lr=1e-3)
 
-        n_updates = 50  # Reduced to prevent overfitting
+        n_updates = 30   # very conservative
         train_returns = []
+        stop_early = False
 
         with st.spinner("Training..."):
             for update in range(n_updates):
+                if stop_early:
+                    break
+
                 actions, old_log_probs, dist = collect_rollout(actor, train_df[state_cols])
-                
-                positions = np.where(actions == 0, 0, np.where(actions == 1, 0.3, -0.3))  # Reduced position size
-                
+
+                # Realistic position sizing (10% max risk)
+                position_size = 0.1
+                positions = np.where(actions == 0, 0, np.where(actions == 1, position_size, -position_size))
+
                 pos_diff = np.abs(np.diff(positions, prepend=0))
                 rewards = positions * train_df['intraday_return'].values - 0.0005 * pos_diff
-                
-                # Amplify rewards and clip extreme
-                rewards = rewards * 5.0
-                rewards = np.clip(rewards, -0.10, 0.10)
-                
+
+                # Clip only – no amplification
+                rewards = np.clip(rewards, -0.03, 0.03)  # realistic daily cap
+
                 with torch.no_grad():
                     values = critic(torch.FloatTensor(train_df[state_cols].values)).squeeze().numpy()
                     next_val = critic(torch.FloatTensor(train_df[state_cols].iloc[-1:].values)).item()
-                
+
                 adv, rets = compute_gae(rewards, values, next_val)
-                
-                # Normalize and clip advantages
+
+                # Normalize & hard clip advantages
                 adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-                adv = np.clip(adv, -5, 5)
-                
-                ppo_update(actor, critic, opt_a, opt_c, train_df[state_cols], actions, old_log_probs, adv, rets)
-                
+                adv = np.clip(adv, -3, 3)
+
+                ppo_update(actor, critic, opt_a, opt_c, train_df[state_cols], actions, old_log_probs, adv, rets, entropy_coeff=0.05)
+
                 cum_ret = (1 + rewards).cumprod()[-1] - 1
                 train_returns.append(cum_ret)
-                
-                if update % 10 == 0:
-                    st.write(f"Update {update}: Train cum return: {cum_ret:.3%}")
 
-                # Decay learning rate
-                for param_group in opt_a.param_groups:
-                    param_group['lr'] *= 0.995
-                for param_group in opt_c.param_groups:
-                    param_group['lr'] *= 0.995
+                if update % 5 == 0:
+                    st.write(f"Update {update}: Train cum return: {cum_ret:.2%}")
 
-        # Plot training progress
+                # Safety stop if exploding
+                if cum_ret > 2.0:  # >200% → stop
+                    st.warning("Early stopping: cumulative return exceeded 200% – likely overfitting.")
+                    stop_early = True
+
+        # Plot equity curve (log scale for visibility)
         fig, ax = plt.subplots()
-        ax.plot(train_returns)
-        ax.set_title("Training Cumulative Returns")
+        ax.semilogy(train_returns)  # log y-scale
+        ax.set_title("Training Equity Curve (log scale)")
         ax.set_xlabel("Updates")
-        ax.set_ylabel("Cumulative Return")
+        ax.set_ylabel("Cumulative Return (log)")
+        ax.grid(True)
         st.pyplot(fig)
 
-        # Test evaluation
+        # Test
         with torch.no_grad():
             test_actions, _, _ = collect_rollout(actor, test_df[state_cols])
-        
-        test_positions = np.where(test_actions == 0, 0, np.where(test_actions == 1, 0.3, -0.3))
+
+        test_positions = np.where(test_actions == 0, 0, np.where(test_actions == 1, 0.1, -0.1))
         test_pos_diff = np.abs(np.diff(test_positions, prepend=0))
         test_rewards = test_positions * test_df['intraday_return'].values - 0.0005 * test_pos_diff
-        
-        # Amplify and clip test rewards
-        test_rewards = test_rewards * 5.0
-        test_rewards = np.clip(test_rewards, -0.10, 0.10)
-        
+        test_rewards = np.clip(test_rewards, -0.03, 0.03)
+
         test_cum_return = (1 + test_rewards).cumprod()[-1] - 1
         test_sharpe = test_rewards.mean() / test_rewards.std() * np.sqrt(252) if test_rewards.std() > 0 else 0
-        
+
         st.success(f"Test Cumulative Return: {test_cum_return:.2%}")
         st.success(f"Annualized Sharpe: {test_sharpe:.2f}")
 
         # Diagnostics
         st.subheader("Diagnostics")
-
-        # Action distribution on test
         test_probs = actor(torch.FloatTensor(test_df[state_cols].values)).detach().numpy().mean(axis=0)
-        st.write("Average test action probabilities [Hold, Long, Short]:", test_probs.round(4))
+        st.write("Avg test action probs [Hold, Long, Short]:", test_probs.round(4))
 
-        # Daily reward stats
-        st.write("Train daily intraday return mean / std:", train_df['intraday_return'].mean().round(6), train_df['intraday_return'].std().round(6))
-        st.write("Test daily intraday return mean / std:", test_df['intraday_return'].mean().round(6), test_df['intraday_return'].std().round(6))
+        st.write("Train intraday mean/std:", train_df['intraday_return'].mean().round(6), train_df['intraday_return'].std().round(6))
+        st.write("Test intraday mean/std:", test_df['intraday_return'].mean().round(6), test_df['intraday_return'].std().round(6))
 
-        # Count how often each action is taken in test
         counts = np.bincount(test_actions, minlength=3)
         st.write("Test action counts [Hold, Long, Short]:", counts)
