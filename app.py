@@ -45,7 +45,7 @@ class ReplayBuffer:
 # ────────────────────────────────────────────────
 # Streamlit App
 # ────────────────────────────────────────────────
-st.title("DQN RL Trading Simulator")
+st.title("DQN RL Trading Simulator – Realistic Version")
 
 uploaded_file = st.file_uploader("Upload gamma_values-old.csv", type="csv")
 
@@ -54,7 +54,7 @@ if uploaded_file is not None:
     df = df.sort_values('TIMESTAMP').reset_index(drop=True)
 
     # ────────────────────────────────────────────────
-    # Feature engineering – lagged to prevent look-ahead
+    # Feature engineering – lagged to prevent look-ahead bias
     # ────────────────────────────────────────────────
     df['prev_return'] = df['NiftyClose'].pct_change().fillna(0)
     df['vol_5d'] = df['prev_return'].rolling(5).std().fillna(0)
@@ -66,7 +66,7 @@ if uploaded_file is not None:
     df['lag_DTE'] = df['DTE'].shift(1)
 
     df['GEX_norm'] = df['lag_GEX'] / 1e6
-    df['flip_prox'] = (df['lag_NiftyClose'] - df['lag_Gamma_Flip']) / df['lag_NiftyClose']
+    df['flip_prox'] = (df['lag_NiftyClose'] - df['lag_Gamma_Flip']) / df['lag_Niftyclose']
     df['superg_spread'] = (df['lag_Max_SuperGamma'] - df['lag_Gamma_Flip']) / 100
     df['dte_norm'] = df['lag_DTE'] / 10
 
@@ -75,7 +75,7 @@ if uploaded_file is not None:
     df[state_cols] = df[state_cols].fillna(0)
     df[state_cols] = (df[state_cols] - df[state_cols].mean()) / df[state_cols].std()
 
-    # Intraday reward
+    # Intraday return
     df['intraday_return'] = (df['NiftyClose'] - df['NiftyOpen']) / df['NiftyOpen']
     df['intraday_return'] = df['intraday_return'].fillna(0)
 
@@ -88,13 +88,17 @@ if uploaded_file is not None:
     n_actions = 3
     gamma = 0.99
     epsilon_start = 1.0
-    epsilon_end = 0.05
-    epsilon_decay = 0.995
+    epsilon_end = 0.02
+    epsilon_decay = 0.998  # slower
     batch_size = 64
     target_update_freq = 500
     learning_rate = 1e-4
     replay_capacity = 20000
-    n_episodes = 30  # episodes = full train sequence replays
+    n_episodes = 100  # increased
+    position_size = 0.1  # realistic
+    transaction_cost = 0.001  # increased
+    lambda_risk = 1.0  # for Sharpe-style penalty
+    stop_early_threshold = 2.0  # stop if cum return >200%
 
     if st.button("Train DQN Model"):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -110,17 +114,20 @@ if uploaded_file is not None:
         epsilon = epsilon_start
         steps = 0
         episode_rewards = []
+        stop_early = False
 
         with st.spinner("Training DQN..."):
             for episode in range(n_episodes):
+                if stop_early:
+                    break
+
                 state = train_df[state_cols].iloc[0].values
                 total_reward = 0
-                position = 0  # start flat
+                position = 0
 
                 for t in range(len(train_df) - 1):
                     steps += 1
 
-                    # Epsilon-greedy action
                     if random.random() < epsilon:
                         action = random.randint(0, n_actions - 1)
                     else:
@@ -128,11 +135,12 @@ if uploaded_file is not None:
                             q_values = policy_net(torch.FloatTensor(state).unsqueeze(0).to(device))
                             action = q_values.argmax().item()
 
-                    # Execute action
-                    new_position = 0 if action == 0 else (1 if action == 1 else -1)
+                    new_position = 0 if action == 0 else (position_size if action == 1 else -position_size)
                     pos_change = abs(new_position - position)
-                    reward = new_position * train_df['intraday_return'].iloc[t] - 0.0005 * pos_change
-                    reward = np.clip(reward, -0.03, 0.03)  # prevent explosion
+                    raw_pnl = new_position * train_df['intraday_return'].iloc[t]
+                    downside_std = np.std(np.where(train_df['intraday_return'].iloc[max(0, t-19):t+1] < 0, train_df['intraday_return'].iloc[max(0, t-19):t+1], 0))
+                    reward = raw_pnl - lambda_risk * downside_std - transaction_cost * pos_change
+                    reward = np.clip(reward, -0.05, 0.05)
 
                     next_state = train_df[state_cols].iloc[t + 1].values
                     done = (t == len(train_df) - 2)
@@ -143,7 +151,6 @@ if uploaded_file is not None:
                     position = new_position
                     total_reward += reward
 
-                    # Training step
                     if len(memory) >= batch_size:
                         states, actions, rewards_b, next_states, dones = memory.sample(batch_size)
 
@@ -154,8 +161,11 @@ if uploaded_file is not None:
                         dones_t = torch.FloatTensor(dones).to(device)
 
                         q_values = policy_net(states_t).gather(1, actions_t).squeeze()
+
+                        # Double DQN
                         with torch.no_grad():
-                            next_q = target_net(next_states_t).max(1)[0]
+                            next_actions = policy_net(next_states_t).argmax(1, keepdim=True)
+                            next_q = target_net(next_states_t).gather(1, next_actions).squeeze()
                             target = rewards_t + gamma * next_q * (1 - dones_t)
 
                         loss = nn.MSELoss()(q_values, target)
@@ -164,15 +174,19 @@ if uploaded_file is not None:
                         loss.backward()
                         optimizer.step()
 
-                    # Update target network
                     if steps % target_update_freq == 0:
                         target_net.load_state_dict(policy_net.state_dict())
 
                 epsilon = max(epsilon_end, epsilon * epsilon_decay)
                 episode_rewards.append(total_reward)
 
-                if episode % 5 == 0:
+                if episode % 10 == 0:
                     st.write(f"Episode {episode}: Total reward: {total_reward:.4f}")
+
+                cum_ret = (1 + np.array(episode_rewards)).cumprod()[-1] - 1
+                if cum_ret > stop_early_threshold:
+                    st.warning("Early stopping: cumulative return exceeded threshold – likely overfitting.")
+                    stop_early = True
 
         # Plot training progress
         fig, ax = plt.subplots()
@@ -194,10 +208,12 @@ if uploaded_file is not None:
                 q_values = policy_net(torch.FloatTensor(state).unsqueeze(0).to(device))
                 action = q_values.argmax().item()
 
-                new_position = 0 if action == 0 else (1 if action == 1 else -1)
+                new_position = 0 if action == 0 else (position_size if action == 1 else -position_size)
                 pos_change = abs(new_position - position)
-                reward = new_position * test_df['intraday_return'].iloc[t] - 0.0005 * pos_change
-                reward = np.clip(reward, -0.03, 0.03)
+                raw_pnl = new_position * test_df['intraday_return'].iloc[t]
+                downside_std = np.std(np.where(test_df['intraday_return'].iloc[max(0, t-19):t+1] < 0, test_df['intraday_return'].iloc[max(0, t-19):t+1], 0))
+                reward = raw_pnl - lambda_risk * downside_std - transaction_cost * pos_change
+                reward = np.clip(reward, -0.05, 0.05)
 
                 test_rewards.append(reward)
                 state = test_df[state_cols].iloc[t + 1].values
@@ -209,16 +225,25 @@ if uploaded_file is not None:
         st.success(f"Test Cumulative Return: {test_cum_return:.2%}")
         st.success(f"Annualized Sharpe: {test_sharpe:.2f}")
 
+        # Test equity curve
+        test_equity = np.cumprod(1 + np.array(test_rewards)) - 1
+        fig_test, ax_test = plt.subplots()
+        ax_test.plot(test_equity)
+        ax_test.set_title("Test Equity Curve")
+        ax_test.set_xlabel("Test Days")
+        ax_test.set_ylabel("Cumulative Return")
+        ax_test.grid(True)
+        st.pyplot(fig_test)
+
         # Diagnostics
         st.subheader("Diagnostics")
-        test_actions = []  # collect for stats
-        # Re-run test to collect actions (simple re-loop)
+        test_actions = []
         position = 0
         for t in range(len(test_df) - 1):
             q_values = policy_net(torch.FloatTensor(test_df[state_cols].iloc[t].values).unsqueeze(0).to(device))
             action = q_values.argmax().item()
             test_actions.append(action)
-            new_position = 0 if action == 0 else (1 if action == 1 else -1)
+            new_position = 0 if action == 0 else (position_size if action == 1 else -position_size)
             position = new_position
 
         counts = np.bincount(test_actions, minlength=3)
@@ -227,4 +252,5 @@ if uploaded_file is not None:
         probs_approx = counts / len(test_actions)
         st.write("Approx test action probs [Hold, Long, Short]:", probs_approx.round(4))
 
+        st.write("Train daily intraday mean / std:", train_df['intraday_return'].mean().round(6), train_df['intraday_return'].std().round(6))
         st.write("Test daily intraday mean / std:", test_df['intraday_return'].mean().round(6), test_df['intraday_return'].std().round(6))
