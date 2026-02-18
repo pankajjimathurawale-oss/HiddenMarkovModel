@@ -1,202 +1,197 @@
-# app.py     ──  Streamlit version ──  Walk-forward / no look-ahead bias (FULLY FIXED)
-
-import streamlit as st
-import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from hmmlearn import hmm
-from datetime import datetime
-
-st.set_page_config(page_title="HMM Gamma Strategy (No Leakage)", layout="wide")
-
-st.title("Nifty Gamma + HMM Strategy – Walk-Forward (No Look-Ahead Bias)")
-st.markdown("Fits model using **only past data**. Bull/bear labels also based on past only.")
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+import streamlit as st
+import matplotlib.pyplot as plt
 
 # ────────────────────────────────────────────────
-# Upload
+# Networks
 # ────────────────────────────────────────────────
-uploaded_file = st.file_uploader("Upload gamma_values-old.csv", type=["csv"])
+class Actor(nn.Module):
+    def __init__(self, state_dim=6, n_actions=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, n_actions), nn.Softmax(dim=-1)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+class Critic(nn.Module):
+    def __init__(self, state_dim=6):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+# ────────────────────────────────────────────────
+# PPO core functions
+# ────────────────────────────────────────────────
+def collect_rollout(actor, states):
+    """ Deterministic replay → one long episode """
+    states_t  = torch.FloatTensor(states.values)
+    probs     = actor(states_t)
+    dist      = Categorical(probs)
+    actions   = dist.sample()
+    log_probs = dist.log_prob(actions)
+    return actions.numpy(), log_probs.detach().numpy()
+
+def compute_gae(rewards, values, next_value, gamma=0.99, lam=0.95):
+    advantages = np.zeros(len(rewards))
+    gae = 0
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * next_value - values[t]
+        gae = delta + gamma * lam * gae
+        advantages[t] = gae
+        next_value = values[t]
+    returns = advantages + values
+    return advantages, returns
+
+def ppo_update(actor, critic, optimizer_a, optimizer_c, states, actions, old_log_probs,
+               advantages, returns, clip_eps=0.2, epochs=10, batch_size=64):
+    states_t = torch.FloatTensor(states.values)
+    actions_t = torch.LongTensor(actions)
+    old_log_probs_t = torch.FloatTensor(old_log_probs)
+    adv_t = torch.FloatTensor(advantages)
+    ret_t = torch.FloatTensor(returns)
+    
+    for _ in range(epochs):
+        perm = torch.randperm(len(states))
+        for idx in range(0, len(states), batch_size):
+            end = idx + batch_size
+            s_idx = perm[idx:end]
+            s = states_t[s_idx]
+            a = actions_t[s_idx]
+            old_lp = old_log_probs_t[s_idx]
+            adv = adv_t[s_idx]
+            ret = ret_t[s_idx]
+            
+            # Actor
+            probs = actor(s)
+            dist = Categorical(probs)
+            new_lp = dist.log_prob(a)
+            ratio = torch.exp(new_lp - old_lp)
+            
+            surr1 = ratio * adv
+            surr2 = torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * adv
+            actor_loss = -torch.min(surr1, surr2).mean()
+            
+            # Critic
+            value = critic(s).squeeze()
+            critic_loss = (value - ret).pow(2).mean()
+            
+            optimizer_a.zero_grad()
+            actor_loss.backward()
+            optimizer_a.step()
+            
+            optimizer_c.zero_grad()
+            critic_loss.backward()
+            optimizer_c.step()
+
+# ────────────────────────────────────────────────
+# Streamlit App
+# ────────────────────────────────────────────────
+st.title("PPO RL Trading Simulator")
+
+uploaded_file = st.file_uploader("Upload gamma_values-old.csv", type="csv")
 
 if uploaded_file is not None:
-    with st.spinner("Loading data..."):
-        df = pd.read_csv(uploaded_file)
-        df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'], format='%m/%d/%Y', errors='coerce')
-        df = df.sort_values('TIMESTAMP').dropna(subset=['TIMESTAMP', 'NiftyClose', 'GEX'])
-
-        df['Returns']    = df['NiftyClose'].pct_change().fillna(0)
-        df['Volatility'] = df['Returns'].rolling(5).std().fillna(0)
-        # GEX_norm computed in walk-forward loop
-
-    st.success(f"Loaded {len(df)} rows  •  {df['TIMESTAMP'].min().date()} → {df['TIMESTAMP'].max().date()}")
+    df = pd.read_csv(uploaded_file, parse_dates=['TIMESTAMP'], date_format='%m/%d/%Y')
+    df = df.sort_values('TIMESTAMP').reset_index(drop=True)
 
     # ────────────────────────────────────────────────
-    # Controls
+    # Feature engineering – lagged to prevent look-ahead bias
     # ────────────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
+    df['prev_return'] = df['NiftyClose'].pct_change().fillna(0)
+    df['vol_5d']      = df['prev_return'].rolling(5).std().fillna(0)
 
-    with col1:
-        n_states = st.selectbox("Number of hidden states", [2, 3, 4], index=1)
+    # Lag gamma & price features (decision at open of t uses data up to t-1)
+    df['lag_GEX']            = df['GEX'].shift(1)
+    df['lag_Gamma_Flip']     = df['Gamma Flip'].shift(1)
+    df['lag_NiftyClose']     = df['NiftyClose'].shift(1)
+    df['lag_Max_SuperGamma'] = df['Max SuperGamma'].shift(1)
+    df['lag_DTE']            = df['DTE'].shift(1)
 
-    with col2:
-        feature_preset = st.selectbox(
-            "Features",
-            [
-                "Only Returns",
-                "Only Volatility",
-                "Only GEX_norm",
-                "Returns + Volatility",
-                "Returns + GEX_norm",
-                "Volatility + GEX_norm",
-                "All three"
-            ],
-            index=4
-        )
+    df['GEX_norm']      = df['lag_GEX'] / 1e6
+    df['flip_prox']     = (df['lag_NiftyClose'] - df['lag_Gamma_Flip']) / df['lag_NiftyClose']
+    df['superg_spread'] = (df['lag_Max_SuperGamma'] - df['lag_Gamma_Flip']) / 100
+    df['dte_norm']      = df['lag_DTE'] / 10
 
-        feature_map = {
-            "Only Returns": ["Returns"],
-            "Only Volatility": ["Volatility"],
-            "Only GEX_norm": ["GEX_norm"],
-            "Returns + Volatility": ["Returns", "Volatility"],
-            "Returns + GEX_norm": ["Returns", "GEX_norm"],
-            "Volatility + GEX_norm": ["Volatility", "GEX_norm"],
-            "All three": ["Returns", "Volatility", "GEX_norm"]
-        }
-        selected_features = feature_map[feature_preset]
+    state_cols = ['GEX_norm', 'flip_prox', 'superg_spread', 'dte_norm', 'prev_return', 'vol_5d']
 
-    with col3:
-        warmup_days = st.number_input("Warm-up period (days)", min_value=50, max_value=400, value=200, step=50)
+    # Fill NaNs (first rows) and normalize
+    df[state_cols] = df[state_cols].fillna(0)
+    df[state_cols] = (df[state_cols] - df[state_cols].mean()) / df[state_cols].std()
 
-    with col4:
-        run_button = st.button("Run Walk-Forward Backtest", type="primary", use_container_width=True)
+    # ────────────────────────────────────────────────
+    # INTRADAY reward (open-to-close, no overnight)
+    # ────────────────────────────────────────────────
+    df['intraday_return'] = (df['NiftyClose'] - df['NiftyOpen']) / df['NiftyOpen']
+    df['intraday_return'] = df['intraday_return'].fillna(0)   # last day or missing
 
-    if run_button:
-        with st.spinner(f"Running walk-forward backtest ({n_states} states, {len(selected_features)} features)..."):
-            df_result = df.copy()
-            df_result['State'] = np.nan
-            df_result['Strategy_Return'] = 0.0
-            df_result['Cum_BH'] = (1 + df_result['Returns']).cumprod()
-            df_result['Cum_Strategy'] = 1.0
+    # Split train/test
+    train_df = df[df['TIMESTAMP'] < '2025-07-01'].copy()
+    test_df = df[df['TIMESTAMP'] >= '2025-07-01'].copy()
 
-            has_gex = 'GEX_norm' in selected_features
+    if st.button("Train PPO Model"):
+        actor = Actor()
+        critic = Critic()
+        opt_a = optim.Adam(actor.parameters(), lr=3e-4)
+        opt_c = optim.Adam(critic.parameters(), lr=1e-3)
 
-            for t in range(warmup_days, len(df_result)):
-                past = df_result.iloc[:t].copy()
+        n_updates = 150
+        train_returns = []
 
-                # Normalize GEX using past only
-                if has_gex:
-                    past_mean = past['GEX'].mean()
-                    past_std  = past['GEX'].std() or 1.0
-                    past['GEX_norm'] = (past['GEX'] - past_mean) / past_std
-                    today_gex_norm = (df_result.iloc[t]['GEX'] - past_mean) / past_std
+        with st.spinner("Training..."):
+            for update in range(n_updates):
+                actions, old_log_probs = collect_rollout(actor, train_df[state_cols])
+                
+                positions = np.where(actions == 0, 0, np.where(actions == 1, 1, -1))
+                pos_diff = np.abs(np.diff(positions, prepend=0))
+                rewards = positions * train_df['intraday_return'].values - 0.0005 * pos_diff
+                
+                with torch.no_grad():
+                    values = critic(torch.FloatTensor(train_df[state_cols].values)).squeeze().numpy()
+                    next_val = critic(torch.FloatTensor(train_df[state_cols].iloc[-1:].values)).item()
+                
+                adv, rets = compute_gae(rewards, values, next_val)
+                
+                ppo_update(actor, critic, opt_a, opt_c, train_df[state_cols], actions, old_log_probs, adv, rets)
+                
+                cum_ret = (1 + rewards).cumprod()[-1] - 1
+                train_returns.append(cum_ret)
+                
+                if update % 20 == 0:
+                    st.write(f"Update {update}: Train cum return: {cum_ret:.3%}")
 
-                past_obs = past[selected_features].values
+        # Plot training progress
+        fig, ax = plt.subplots()
+        ax.plot(train_returns)
+        ax.set_title("Training Cumulative Returns")
+        ax.set_xlabel("Updates")
+        ax.set_ylabel("Cumulative Return")
+        st.pyplot(fig)
 
-                model = hmm.GaussianHMM(
-                    n_components=n_states,
-                    covariance_type="diag",
-                    n_iter=80,
-                    init_params="stmc",
-                    verbose=False
-                )
-
-                try:
-                    model.fit(past_obs)
-                except:
-                    continue
-
-                # Get past states → compute historical means using PAST only
-                past_states = model.predict(past_obs)
-                past['State'] = past_states
-
-                mean_ret = past.groupby('State')['Returns'].mean()
-
-                if len(mean_ret) < 2:
-                    strategy_ret_today = 0.0
-                else:
-                    bull_state = mean_ret.idxmax()
-                    bear_state = mean_ret.idxmin()
-
-                    # Today's observation
-                    today_row = df_result.iloc[t:t+1].copy()
-                    if has_gex:
-                        today_row['GEX_norm'] = today_gex_norm
-                    today_obs = today_row[selected_features].values
-
-                    today_state = model.predict(today_obs)[0]
-
-                    if today_state == bull_state:
-                        strategy_ret_today = df_result.iloc[t]['Returns']
-                    elif today_state == bear_state:
-                        strategy_ret_today = -df_result.iloc[t]['Returns']
-                    else:
-                        strategy_ret_today = 0.0
-
-                    df_result.iloc[t, df_result.columns.get_loc('State')] = today_state
-
-                df_result.iloc[t, df_result.columns.get_loc('Strategy_Return')] = strategy_ret_today
-
-                # Update cumulative
-                prev = df_result.iloc[t-1]['Cum_Strategy']
-                df_result.iloc[t, df_result.columns.get_loc('Cum_Strategy')] = prev * (1 + strategy_ret_today)
-
-        # ────────────────────────────────────────────────
-        # Results
-        # ────────────────────────────────────────────────
-        oos = df_result.iloc[warmup_days:]
-
-        bh_total  = oos['Cum_BH'].iloc[-1] / oos['Cum_BH'].iloc[0] - 1
-        strat_total = oos['Cum_Strategy'].iloc[-1] / oos['Cum_Strategy'].iloc[0] - 1
-
-        bh_sharpe    = oos['Returns'].mean() / oos['Returns'].std() * np.sqrt(252) if oos['Returns'].std() else 0
-        strat_sharpe = oos['Strategy_Return'].mean() / oos['Strategy_Return'].std() * np.sqrt(252) if oos['Strategy_Return'].std() else 0
-
-        trades = (oos['State'].diff() != 0).sum()
-
-        colA, colB, colC, colD = st.columns(4)
-        colA.metric("Strategy Return (OOS)", f"{strat_total:.2%}")
-        colB.metric("Buy & Hold Return (OOS)", f"{bh_total:.2%}")
-        colC.metric("Strategy Sharpe", f"{strat_sharpe:.2f}")
-        colD.metric("Trades", int(trades))
-
-        # Equity curve
-        st.subheader("Equity Curve (after warm-up)")
-
-        fig = go.Figure()
-
-        fig.add_trace(go.Scatter(
-            x=oos['TIMESTAMP'], y=oos['Cum_BH'],
-            name="Buy & Hold", line=dict(color='gray')
-        ))
-
-        fig.add_trace(go.Scatter(
-            x=oos['TIMESTAMP'], y=oos['Cum_Strategy'],
-            name="Strategy", line=dict(color='#00CC96')
-        ))
-
-        fig.update_layout(height=500, hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Regime plot
-        st.subheader("Detected States (after warm-up)")
-
-        fig_reg = px.line(
-            oos, x='TIMESTAMP', y='NiftyClose', color='State',
-            title=f"{n_states}-state regimes (walk-forward)"
-        )
-        fig_reg.update_traces(line_width=2.2)
-        st.plotly_chart(fig_reg, use_container_width=True)
-
-        # Table preview
-        with st.expander("Last 200 rows of results"):
-            st.dataframe(
-                oos[['TIMESTAMP', 'NiftyClose', 'Returns', 'State', 'Strategy_Return']]
-                .tail(200)
-                .style.format({
-                    'Returns': '{:.4f}',
-                    'Strategy_Return': '{:.4f}'
-                })
-            )
-
-else:
-    st.info("Please upload your gamma_values-old.csv file.")
+        # Test evaluation
+        with torch.no_grad():
+            test_actions, _ = collect_rollout(actor, test_df[state_cols])
+        
+        test_positions = np.where(test_actions == 0, 0, np.where(test_actions == 1, 1, -1))
+        test_pos_diff = np.abs(np.diff(test_positions, prepend=0))
+        test_rewards = test_positions * test_df['intraday_return'].values - 0.0005 * test_pos_diff
+        
+        test_cum_return = (1 + test_rewards).cumprod()[-1] - 1
+        test_sharpe = test_rewards.mean() / test_rewards.std() * np.sqrt(252) if test_rewards.std() > 0 else 0
+        
+        st.success(f"Test Cumulative Return: {test_cum_return:.2%}")
+        st.success(f"Annualized Sharpe: {test_sharpe:.2f}")
