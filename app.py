@@ -44,7 +44,7 @@ def collect_rollout(actor, states):
     dist      = Categorical(probs)
     actions   = dist.sample()
     log_probs = dist.log_prob(actions)
-    return actions.numpy(), log_probs.detach().numpy()
+    return actions.numpy(), log_probs.detach().numpy(), dist
 
 def compute_gae(rewards, values, next_value, gamma=0.99, lam=0.95):
     advantages = np.zeros(len(rewards))
@@ -58,7 +58,7 @@ def compute_gae(rewards, values, next_value, gamma=0.99, lam=0.95):
     return advantages, returns
 
 def ppo_update(actor, critic, optimizer_a, optimizer_c, states, actions, old_log_probs,
-               advantages, returns, clip_eps=0.2, epochs=10, batch_size=64):
+               advantages, returns, clip_eps=0.2, entropy_coeff=0.01, epochs=10, batch_size=64):
     states_t = torch.FloatTensor(states.values)
     actions_t = torch.LongTensor(actions)
     old_log_probs_t = torch.FloatTensor(old_log_probs)
@@ -84,7 +84,7 @@ def ppo_update(actor, critic, optimizer_a, optimizer_c, states, actions, old_log
             
             surr1 = ratio * adv
             surr2 = torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * adv
-            actor_loss = -torch.min(surr1, surr2).mean()
+            actor_loss = -torch.min(surr1, surr2).mean() - entropy_coeff * dist.entropy().mean()
             
             # Critic
             value = critic(s).squeeze()
@@ -149,16 +149,19 @@ if uploaded_file is not None:
         opt_a = optim.Adam(actor.parameters(), lr=3e-4)
         opt_c = optim.Adam(critic.parameters(), lr=1e-3)
 
-        n_updates = 150
+        n_updates = 50  # Reduced to prevent overfitting
         train_returns = []
 
         with st.spinner("Training..."):
             for update in range(n_updates):
-                actions, old_log_probs = collect_rollout(actor, train_df[state_cols])
+                actions, old_log_probs, dist = collect_rollout(actor, train_df[state_cols])  # Added dist for entropy
                 
                 positions = np.where(actions == 0, 0, np.where(actions == 1, 1, -1))
                 pos_diff = np.abs(np.diff(positions, prepend=0))
                 rewards = positions * train_df['intraday_return'].values - 0.0005 * pos_diff
+                
+                # Clip rewards
+                rewards = np.clip(rewards, -0.05, 0.05)
                 
                 with torch.no_grad():
                     values = critic(torch.FloatTensor(train_df[state_cols].values)).squeeze().numpy()
@@ -166,12 +169,15 @@ if uploaded_file is not None:
                 
                 adv, rets = compute_gae(rewards, values, next_val)
                 
+                # Normalize advantages
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                
                 ppo_update(actor, critic, opt_a, opt_c, train_df[state_cols], actions, old_log_probs, adv, rets)
                 
                 cum_ret = (1 + rewards).cumprod()[-1] - 1
                 train_returns.append(cum_ret)
                 
-                if update % 20 == 0:
+                if update % 10 == 0:
                     st.write(f"Update {update}: Train cum return: {cum_ret:.3%}")
 
         # Plot training progress
@@ -184,14 +190,21 @@ if uploaded_file is not None:
 
         # Test evaluation
         with torch.no_grad():
-            test_actions, _ = collect_rollout(actor, test_df[state_cols])
+            test_actions, _, _ = collect_rollout(actor, test_df[state_cols])
         
         test_positions = np.where(test_actions == 0, 0, np.where(test_actions == 1, 1, -1))
         test_pos_diff = np.abs(np.diff(test_positions, prepend=0))
         test_rewards = test_positions * test_df['intraday_return'].values - 0.0005 * test_pos_diff
+        
+        # Clip test rewards
+        test_rewards = np.clip(test_rewards, -0.05, 0.05)
         
         test_cum_return = (1 + test_rewards).cumprod()[-1] - 1
         test_sharpe = test_rewards.mean() / test_rewards.std() * np.sqrt(252) if test_rewards.std() > 0 else 0
         
         st.success(f"Test Cumulative Return: {test_cum_return:.2%}")
         st.success(f"Annualized Sharpe: {test_sharpe:.2f}")
+
+        # Action distribution for diagnostics
+        test_probs = actor(torch.FloatTensor(test_df[state_cols].values)).detach().numpy()
+        st.write("Average test action probs (Hold, Long, Short):", test_probs.mean(axis=0))
