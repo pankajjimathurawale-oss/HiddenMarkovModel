@@ -3,8 +3,8 @@ pandas>=2.0
 numpy>=1.24
 plotly>=5.18
 hmmlearn>=0.3.2
-streamlit, 
-torch, 
-pandas,
-numpy,
+streamlit
+torch
+pandas
+numpy
 matplotlib
