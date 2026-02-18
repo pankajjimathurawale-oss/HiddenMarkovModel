@@ -58,7 +58,7 @@ def compute_gae(rewards, values, next_value, gamma=0.99, lam=0.95):
     return advantages, returns
 
 def ppo_update(actor, critic, optimizer_a, optimizer_c, states, actions, old_log_probs,
-               advantages, returns, clip_eps=0.2, entropy_coeff=0.01, epochs=10, batch_size=64):
+               advantages, returns, clip_eps=0.2, entropy_coeff=0.03, epochs=10, batch_size=64):
     states_t = torch.FloatTensor(states.values)
     actions_t = torch.LongTensor(actions)
     old_log_probs_t = torch.FloatTensor(old_log_probs)
@@ -154,14 +154,16 @@ if uploaded_file is not None:
 
         with st.spinner("Training..."):
             for update in range(n_updates):
-                actions, old_log_probs, dist = collect_rollout(actor, train_df[state_cols])  # Added dist for entropy
+                actions, old_log_probs, dist = collect_rollout(actor, train_df[state_cols])
                 
-                positions = np.where(actions == 0, 0, np.where(actions == 1, 1, -1))
+                positions = np.where(actions == 0, 0, np.where(actions == 1, 0.3, -0.3))  # Reduced position size
+                
                 pos_diff = np.abs(np.diff(positions, prepend=0))
                 rewards = positions * train_df['intraday_return'].values - 0.0005 * pos_diff
                 
-                # Clip rewards
-                rewards = np.clip(rewards, -0.05, 0.05)
+                # Amplify rewards and clip extreme
+                rewards = rewards * 5.0
+                rewards = np.clip(rewards, -0.10, 0.10)
                 
                 with torch.no_grad():
                     values = critic(torch.FloatTensor(train_df[state_cols].values)).squeeze().numpy()
@@ -169,8 +171,9 @@ if uploaded_file is not None:
                 
                 adv, rets = compute_gae(rewards, values, next_val)
                 
-                # Normalize advantages
+                # Normalize and clip advantages
                 adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                adv = np.clip(adv, -5, 5)
                 
                 ppo_update(actor, critic, opt_a, opt_c, train_df[state_cols], actions, old_log_probs, adv, rets)
                 
@@ -179,6 +182,12 @@ if uploaded_file is not None:
                 
                 if update % 10 == 0:
                     st.write(f"Update {update}: Train cum return: {cum_ret:.3%}")
+
+                # Decay learning rate
+                for param_group in opt_a.param_groups:
+                    param_group['lr'] *= 0.995
+                for param_group in opt_c.param_groups:
+                    param_group['lr'] *= 0.995
 
         # Plot training progress
         fig, ax = plt.subplots()
@@ -192,12 +201,13 @@ if uploaded_file is not None:
         with torch.no_grad():
             test_actions, _, _ = collect_rollout(actor, test_df[state_cols])
         
-        test_positions = np.where(test_actions == 0, 0, np.where(test_actions == 1, 1, -1))
+        test_positions = np.where(test_actions == 0, 0, np.where(test_actions == 1, 0.3, -0.3))
         test_pos_diff = np.abs(np.diff(test_positions, prepend=0))
         test_rewards = test_positions * test_df['intraday_return'].values - 0.0005 * test_pos_diff
         
-        # Clip test rewards
-        test_rewards = np.clip(test_rewards, -0.05, 0.05)
+        # Amplify and clip test rewards
+        test_rewards = test_rewards * 5.0
+        test_rewards = np.clip(test_rewards, -0.10, 0.10)
         
         test_cum_return = (1 + test_rewards).cumprod()[-1] - 1
         test_sharpe = test_rewards.mean() / test_rewards.std() * np.sqrt(252) if test_rewards.std() > 0 else 0
@@ -205,6 +215,17 @@ if uploaded_file is not None:
         st.success(f"Test Cumulative Return: {test_cum_return:.2%}")
         st.success(f"Annualized Sharpe: {test_sharpe:.2f}")
 
-        # Action distribution for diagnostics
-        test_probs = actor(torch.FloatTensor(test_df[state_cols].values)).detach().numpy()
-        st.write("Average test action probs (Hold, Long, Short):", test_probs.mean(axis=0))
+        # Diagnostics
+        st.subheader("Diagnostics")
+
+        # Action distribution on test
+        test_probs = actor(torch.FloatTensor(test_df[state_cols].values)).detach().numpy().mean(axis=0)
+        st.write("Average test action probabilities [Hold, Long, Short]:", test_probs.round(4))
+
+        # Daily reward stats
+        st.write("Train daily intraday return mean / std:", train_df['intraday_return'].mean().round(6), train_df['intraday_return'].std().round(6))
+        st.write("Test daily intraday return mean / std:", test_df['intraday_return'].mean().round(6), test_df['intraday_return'].std().round(6))
+
+        # Count how often each action is taken in test
+        counts = np.bincount(test_actions, minlength=3)
+        st.write("Test action counts [Hold, Long, Short]:", counts)
