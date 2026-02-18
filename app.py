@@ -54,21 +54,21 @@ if uploaded_file is not None:
     df = df.sort_values('TIMESTAMP').reset_index(drop=True)
 
     # ────────────────────────────────────────────────
-    # Feature engineering – lagged to prevent look-ahead
+    # Feature engineering – lagged to prevent look-ahead bias
     # ────────────────────────────────────────────────
     df['prev_return'] = df['NiftyClose'].pct_change().fillna(0)
-    df['vol_5d']      = df['prev_return'].rolling(5).std().fillna(0)
+    df['vol_5d'] = df['prev_return'].rolling(5).std().fillna(0)
 
-    df['lag_GEX']            = df['GEX'].shift(1)
-    df['lag_Gamma_Flip']     = df['Gamma Flip'].shift(1)
-    df['lag_NiftyClose']     = df['NiftyClose'].shift(1)
+    df['lag_GEX'] = df['GEX'].shift(1)
+    df['lag_Gamma_Flip'] = df['Gamma Flip'].shift(1)
+    df['lag_NiftyClose'] = df['NiftyClose'].shift(1)
     df['lag_Max_SuperGamma'] = df['Max SuperGamma'].shift(1)
-    df['lag_DTE']            = df['DTE'].shift(1)
+    df['lag_DTE'] = df['DTE'].shift(1)
 
-    df['GEX_norm']      = df['lag_GEX'] / 1e6
-    df['flip_prox']     = (df['lag_NiftyClose'] - df['lag_Gamma_Flip']) / df['lag_NiftyClose']
+    df['GEX_norm'] = df['lag_GEX'] / 1e6
+    df['flip_prox'] = (df['lag_NiftyClose'] - df['lag_Gamma_Flip']) / df['lag_NiftyClose']
     df['superg_spread'] = (df['lag_Max_SuperGamma'] - df['lag_Gamma_Flip']) / 100
-    df['dte_norm']      = df['lag_DTE'] / 10
+    df['dte_norm'] = df['lag_DTE'] / 10
 
     state_cols = ['GEX_norm', 'flip_prox', 'superg_spread', 'dte_norm', 'prev_return', 'vol_5d']
 
@@ -82,7 +82,7 @@ if uploaded_file is not None:
 
     # Split
     train_df = df[df['TIMESTAMP'] < '2025-07-01'].copy()
-    test_df  = df[df['TIMESTAMP'] >= '2025-07-01'].copy()
+    test_df = df[df['TIMESTAMP'] >= '2025-07-01'].copy()
 
     st.write(f"Train rows: {len(train_df)} | Test rows: {len(test_df)}")
 
@@ -101,12 +101,12 @@ if uploaded_file is not None:
     replay_capacity = 20000
     n_episodes = 150
     position_size = 0.1
-    transaction_cost = 0.0002      # very low now
-    sharpe_window = 20             # rolling window for Sharpe
-    sharpe_scale = 10.0            # amplify Sharpe signal
-    epsilon = 1e-6                 # avoid div-by-zero in std
+    transaction_cost = 0.0002
+    sharpe_window = 20
+    sharpe_scale = 10.0
+    epsilon_div = 1e-6
 
-    if st.button("Train DQN Model (Sharpe-shaped Reward)"):
+    if st.button("Train DQN Model"):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         policy_net = DQN(state_dim, n_actions).to(device)
@@ -117,7 +117,10 @@ if uploaded_file is not None:
         optimizer = optim.Adam(policy_net.parameters(), lr=lr)
         memory = ReplayBuffer(replay_capacity)
 
+        epsilon = epsilon_start
+        steps = 0
         episode_rewards = []
+
         progress_bar = st.progress(0)
 
         for episode in range(n_episodes):
@@ -126,7 +129,8 @@ if uploaded_file is not None:
             position = 0
 
             for t in range(len(train_df) - 1):
-                # Epsilon-greedy
+                steps += 1
+
                 if random.random() < epsilon:
                     action = random.randint(0, n_actions - 1)
                 else:
@@ -137,17 +141,14 @@ if uploaded_file is not None:
                 new_position = 0 if action == 0 else (position_size if action == 1 else -position_size)
                 pos_change = abs(new_position - position)
 
-                # Excess return
-                excess = new_position * (train_df['intraday_return'].iloc[t] - train_df['market_intraday'].iloc[t])
-
-                # Rolling Sharpe-shaped reward
+                # Sharpe-shaped reward
                 window_start = max(0, t - sharpe_window + 1)
                 window_excess = new_position * (train_df['intraday_return'].iloc[window_start:t+1] - train_df['market_intraday'].iloc[window_start:t+1])
                 mean_excess = np.mean(window_excess)
-                std_excess = np.std(window_excess) + epsilon
+                std_excess = np.std(window_excess) + epsilon_div
                 sharpe_reward = mean_excess / std_excess
                 reward = sharpe_reward * sharpe_scale - transaction_cost * pos_change
-                reward = np.clip(reward, -0.5, 0.5)  # wider clip for Sharpe
+                reward = np.clip(reward, -0.5, 0.5)
 
                 next_state = train_df[state_cols].iloc[t + 1].values
                 done = (t == len(train_df) - 2)
@@ -158,7 +159,6 @@ if uploaded_file is not None:
                 position = new_position
                 total_reward += reward
 
-                # Training step
                 if len(memory) >= batch_size:
                     states, actions, rewards_b, next_states, dones = memory.sample(batch_size)
 
@@ -170,7 +170,6 @@ if uploaded_file is not None:
 
                     q_values = policy_net(states_t).gather(1, actions_t).squeeze()
 
-                    # Double DQN
                     with torch.no_grad():
                         next_actions = policy_net(next_states_t).argmax(1, keepdim=True)
                         next_q = target_net(next_states_t).gather(1, next_actions).squeeze()
@@ -203,7 +202,7 @@ if uploaded_file is not None:
         st.pyplot(fig)
 
         # ────────────────────────────────────────────────
-        # Test (greedy policy)
+        # Test evaluation (greedy policy)
         # ────────────────────────────────────────────────
         test_rewards = []
         position = 0
@@ -219,12 +218,10 @@ if uploaded_file is not None:
                 new_position = 0 if action == 0 else (position_size if action == 1 else -position_size)
                 pos_change = abs(new_position - position)
 
-                excess = new_position * (test_df['intraday_return'].iloc[t] - test_df['market_intraday'].iloc[t])
-
                 window_start = max(0, t - sharpe_window + 1)
                 window_excess = new_position * (test_df['intraday_return'].iloc[window_start:t+1] - test_df['market_intraday'].iloc[window_start:t+1])
                 mean_excess = np.mean(window_excess)
-                std_excess = np.std(window_excess) + epsilon
+                std_excess = np.std(window_excess) + epsilon_div
                 sharpe_reward = mean_excess / std_excess
                 reward = sharpe_reward * sharpe_scale - transaction_cost * pos_change
                 reward = np.clip(reward, -0.5, 0.5)
